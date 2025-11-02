@@ -2335,6 +2335,7 @@ extern const struct verbs_device_ops verbs_provider_vmw_pvrdma;
 extern const struct verbs_device_ops verbs_provider_ionic;
 extern const struct verbs_device_ops verbs_provider_all;
 extern const struct verbs_device_ops verbs_provider_none;
+extern const struct verbs_device_ops verbs_provider_bordma;
 void ibv_static_providers(void *unused, ...);
 
 static inline struct ibv_device **__ibv_get_device_list(int *num_devices)
