@@ -12,6 +12,8 @@
 #include <infiniband/driver.h>
 #include <infiniband/kern-abi.h>
 
+#define NUM_BACKEND_QP 4  /* Number of backend QPs per frontend QP */
+
 static const struct verbs_context_ops bordma_context_ops; 
 struct bordma_device {
 	struct verbs_device base_dev;
@@ -23,9 +25,22 @@ struct bordma_context {
 	int b;
 };
 
+struct bordma_qp {
+	struct verbs_qp verbs_qp;          /* Frontend QP */
+	struct ibv_qp **backend_qps;       /* Array of backend QPs */
+	struct ibv_cq *shared_cq;          /* Shared CQ for all backend QPs */
+	struct ibv_pd *backend_pd;         /* Backend protection domain */
+	int num_backend_qps;               /* Number of backend QPs created */
+};
+
 static inline struct bordma_context *ctx_ibv2bordma(struct ibv_context *base)
 {
 	return container_of(base, struct bordma_context, base_ctx.context);
+}
+
+static inline struct bordma_qp *qp_ibv2bordma(struct ibv_qp *base)
+{
+	return container_of(base, struct bordma_qp, verbs_qp.qp);
 }
 
 
@@ -101,20 +116,145 @@ static void bordma_free_context(struct ibv_context *ibv_ctx)
 	free(ctx);
 }
 
+static struct ibv_qp *bordma_create_qp(struct ibv_pd *pd,
+					struct ibv_qp_init_attr *attr)
+{
+	struct ibv_create_qp cmd = {};
+	struct ib_uverbs_create_qp_resp resp = {};
+	struct bordma_qp *qp;
+	struct ibv_qp_init_attr backend_attr;
+	int ret, i;
+
+	/* Allocate QP structure */
+	qp = calloc(1, sizeof(*qp));
+	if (!qp)
+		return NULL;
+
+	/* Allocate array for backend QPs */
+	qp->backend_qps = calloc(NUM_BACKEND_QP, sizeof(struct ibv_qp *));
+	if (!qp->backend_qps) {
+		free(qp);
+		return NULL;
+	}
+
+	/* Create frontend QP (for compatibility) */
+	ret = ibv_cmd_create_qp(pd, &qp->verbs_qp.qp, attr,
+				&cmd, sizeof(cmd),
+				&resp, sizeof(resp));
+	if (ret)
+		goto err_free_backend_array;
+
+	/* Store backend PD */
+	qp->backend_pd = pd;
+
+	/* Create shared CQ for all backend QPs */
+	qp->shared_cq = ibv_create_cq(pd->context, 
+				      attr->cap.max_send_wr * NUM_BACKEND_QP + 
+				      attr->cap.max_recv_wr * NUM_BACKEND_QP,
+				      NULL, NULL, 0);
+	if (!qp->shared_cq) {
+		fprintf(stderr, "Failed to create shared CQ for backend QPs\n");
+		goto err_destroy_frontend_qp;
+	}
+
+	/* Prepare backend QP attributes */
+	memcpy(&backend_attr, attr, sizeof(backend_attr));
+	backend_attr.send_cq = qp->shared_cq;
+	backend_attr.recv_cq = qp->shared_cq;
+
+	/* Create NUM_BACKEND_QP backend QPs, all using the shared CQ */
+	for (i = 0; i < NUM_BACKEND_QP; i++) {
+		qp->backend_qps[i] = ibv_create_qp(pd, &backend_attr);
+		if (!qp->backend_qps[i]) {
+			fprintf(stderr, "Failed to create backend QP %d/%d\n", 
+				i + 1, NUM_BACKEND_QP);
+			goto err_destroy_backend_qps;
+		}
+		qp->num_backend_qps++;
+		printf("Created backend QP %d/%d (QPN: %d)\n", 
+		       i + 1, NUM_BACKEND_QP, qp->backend_qps[i]->qp_num);
+	}
+
+	/* Set initial QP state */
+	qp->verbs_qp.qp.state = IBV_QPS_RESET;
+
+	printf("Successfully created bordma QP with %d backend QPs sharing CQ (handle: %d)\n",
+	       NUM_BACKEND_QP, qp->shared_cq->handle);
+
+	return &qp->verbs_qp.qp;
+
+err_destroy_backend_qps:
+	/* Destroy any backend QPs that were created */
+	for (i = 0; i < qp->num_backend_qps; i++) {
+		if (qp->backend_qps[i])
+			ibv_destroy_qp(qp->backend_qps[i]);
+	}
+	ibv_destroy_cq(qp->shared_cq);
+err_destroy_frontend_qp:
+	ibv_cmd_destroy_qp(&qp->verbs_qp.qp);
+err_free_backend_array:
+	free(qp->backend_qps);
+	free(qp);
+	return NULL;
+}
+
+static int bordma_destroy_qp(struct ibv_qp *ibqp)
+{
+	struct bordma_qp *qp = qp_ibv2bordma(ibqp);
+	int ret, i;
+
+	printf("Destroying bordma QP with %d backend QPs\n", qp->num_backend_qps);
+
+	/* Destroy all backend QPs */
+	for (i = 0; i < qp->num_backend_qps; i++) {
+		if (qp->backend_qps[i]) {
+			ret = ibv_destroy_qp(qp->backend_qps[i]);
+			if (ret) {
+				fprintf(stderr, "Failed to destroy backend QP %d: %d\n", 
+					i, ret);
+			} else {
+				printf("Destroyed backend QP %d/%d\n", 
+				       i + 1, qp->num_backend_qps);
+			}
+		}
+	}
+
+	/* Destroy the shared CQ */
+	if (qp->shared_cq) {
+		ret = ibv_destroy_cq(qp->shared_cq);
+		if (ret) {
+			fprintf(stderr, "Failed to destroy shared CQ: %d\n", ret);
+		} else {
+			printf("Destroyed shared CQ\n");
+		}
+	}
+
+	/* Destroy the frontend QP in kernel */
+	ret = ibv_cmd_destroy_qp(ibqp);
+	if (ret)
+		fprintf(stderr, "Failed to destroy frontend QP: %d\n", ret);
+
+	/* Free allocated memory */
+	free(qp->backend_qps);
+	free(qp);
+
+	return ret;
+}
+
 static const struct verbs_context_ops bordma_context_ops = {
 	.query_device_ex = bordma_query_device,
 	.query_port = bordma_query_port,
 	.free_context = bordma_free_context,
+	.create_qp = bordma_create_qp,
+	.destroy_qp = bordma_destroy_qp,
 	#if 0
 	.alloc_pd = bordma_alloc_pd,
 	.async_event = bordma_async_event,
 	.create_cq = bordma_create_cq,
-	.create_qp = bordma_create_qp,
 	.create_srq = bordma_create_srq,
 	.dealloc_pd = bordma_free_pd,
 	.dereg_mr = bordma_dereg_mr,
 	.destroy_cq = bordma_destroy_cq,
-	.destroy_qp = bordma_destroy_qp,
 	.destroy_srq = bordma_destroy_srq,
 	.modify_qp = bordma_modify_qp,
 	.modify_srq = bordma_modify_srq,
